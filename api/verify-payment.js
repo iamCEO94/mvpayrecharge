@@ -1,51 +1,58 @@
-import Cors from "cors";
+// api/verify-payment.js
 import fetch from "node-fetch";
 import admin from "firebase-admin";
 
-// Enable CORS
-const cors = Cors({ origin: "*", methods: ["POST", "OPTIONS"] });
-
-// Initialize Firebase Admin with single service key variable
+// Initialize Firebase Admin only once
 if (!admin.apps.length) {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
   });
 }
-
 const db = admin.firestore();
 
-export default function handler(req, res) {
-  return cors(req, res, async () => {
-    if (req.method !== "POST") return res.status(405).json({ success: false, message: "Method not allowed" });
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ success: false, message: "Method not allowed" });
+  }
 
-    const { uid, amount, reference } = req.body;
+  const { reference, uid, amount } = req.body;
 
-    if (!uid || !amount || !reference) {
-      return res.status(400).json({ success: false, message: "Missing required fields" });
-    }
+  if (!reference || !uid || !amount) {
+    return res.status(400).json({ success: false, message: "Missing required fields" });
+  }
 
-    try {
-      const verifyRes = await fetch(`https://api.paystack.co/transaction/verify/${reference}`, {
-        method: "GET",
-        headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
-      });
+  try {
+    // Verify transaction with Paystack
+    const response = await fetch(`https://api.paystack.co/transaction/verify/${reference}`, {
+      headers: {
+        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, // 🔑 your Paystack SECRET key in Vercel
+      },
+    });
+    const data = await response.json();
 
-      const verifyData = await verifyRes.json();
-      if (!verifyData.status || verifyData.data.status !== "success") {
-        return res.status(400).json({ success: false, message: "Payment verification failed" });
-      }
-
+    if (data.status && data.data.status === "success") {
       const userRef = db.collection("users").doc(uid);
-      await userRef.update({
-        balance: admin.firestore.FieldValue.increment(amount),
-        totalRecharge: admin.firestore.FieldValue.increment(amount),
+
+      await db.runTransaction(async (t) => {
+        const doc = await t.get(userRef);
+        if (!doc.exists) throw new Error("User not found");
+
+        const currentBalance = doc.data().balance || 0;
+        const totalRecharge = doc.data().totalRecharge || 0;
+
+        t.update(userRef, {
+          balance: currentBalance + Number(amount),
+          totalRecharge: totalRecharge + Number(amount),
+        });
       });
 
-      return res.json({ success: true, message: "Recharge successful" });
-    } catch (err) {
-      console.error(err);
-      return res.status(500).json({ success: false, message: "Server error" });
+      return res.status(200).json({ success: true, message: "Payment verified and wallet updated" });
+    } else {
+      return res.status(400).json({ success: false, message: "Verification failed" });
     }
-  });
+  } catch (error) {
+    console.error("Error verifying payment:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
 }
