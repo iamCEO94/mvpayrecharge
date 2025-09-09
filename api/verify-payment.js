@@ -1,58 +1,74 @@
-// api/verify-payment.js
 import fetch from "node-fetch";
 import admin from "firebase-admin";
 
-// Initialize Firebase Admin only once
+// Initialize Firebase only once
 if (!admin.apps.length) {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
   admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
+    credential: admin.credential.cert({
+      type: process.env.FIREBASE_TYPE,
+      project_id: process.env.FIREBASE_PROJECT_ID,
+      private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+      private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+      client_email: process.env.FIREBASE_CLIENT_EMAIL,
+      client_id: process.env.FIREBASE_CLIENT_ID,
+      auth_uri: process.env.FIREBASE_AUTH_URI,
+      token_uri: process.env.FIREBASE_TOKEN_URI,
+      auth_provider_x509_cert_url: process.env.FIREBASE_AUTH_PROVIDER,
+      client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL
+    }),
+    databaseURL: "https://mvpay-7d2ad-default-rtdb.firebaseio.com"
   });
 }
+
 const db = admin.firestore();
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
-    return res.status(405).json({ success: false, message: "Method not allowed" });
+    return res.status(405).json({ message: "Only POST requests allowed" });
   }
 
-  const { reference, uid, amount } = req.body;
-
-  if (!reference || !uid || !amount) {
-    return res.status(400).json({ success: false, message: "Missing required fields" });
+  const { reference, userId } = req.body;
+  if (!reference || !userId) {
+    return res.status(400).json({ message: "Missing parameters" });
   }
 
   try {
-    // Verify transaction with Paystack
-    const response = await fetch(`https://api.paystack.co/transaction/verify/${reference}`, {
-      headers: {
-        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, // 🔑 your Paystack SECRET key in Vercel
-      },
-    });
+    // Verify payment with Paystack
+    const response = await fetch(
+      `https://api.paystack.co/transaction/verify/${reference}`,
+      {
+        method: "GET",
+        headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` }
+      }
+    );
     const data = await response.json();
 
     if (data.status && data.data.status === "success") {
-      const userRef = db.collection("users").doc(uid);
+      const amountPaid = data.data.amount / 100; // Convert kobo to naira
 
-      await db.runTransaction(async (t) => {
-        const doc = await t.get(userRef);
-        if (!doc.exists) throw new Error("User not found");
+      // Update user balance in Firestore
+      const userRef = db.collection("users").doc(userId);
+      const userDoc = await userRef.get();
 
-        const currentBalance = doc.data().balance || 0;
-        const totalRecharge = doc.data().totalRecharge || 0;
+      let newBalance = amountPaid;
+      let totalRecharge = amountPaid;
 
-        t.update(userRef, {
-          balance: currentBalance + Number(amount),
-          totalRecharge: totalRecharge + Number(amount),
-        });
-      });
+      if (userDoc.exists) {
+        const userData = userDoc.data();
+        newBalance += userData.balance || 0;
+        totalRecharge += userData.totalRecharge || 0;
+      }
 
-      return res.status(200).json({ success: true, message: "Payment verified and wallet updated" });
+      await userRef.set(
+        { balance: newBalance, totalRecharge: totalRecharge },
+        { merge: true }
+      );
+
+      return res.status(200).json({ success: true, amount: amountPaid });
     } else {
-      return res.status(400).json({ success: false, message: "Verification failed" });
+      return res.status(400).json({ success: false, message: "Payment failed" });
     }
-  } catch (error) {
-    console.error("Error verifying payment:", error);
-    return res.status(500).json({ success: false, message: "Server error" });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
 }
